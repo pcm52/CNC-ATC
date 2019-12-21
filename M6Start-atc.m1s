@@ -1,0 +1,308 @@
+'tool = GetSelectedTool()
+'SetCurrentTool( tool )
+'
+Dim OldTool As Single
+Dim NewTool As Single
+Dim Move_Command
+Dim ATC_Tool
+Dim Return_Code As Single
+Dim ATC_State
+Dim UResult
+Dim Spin_Up
+Dim Spin_down
+Dim ATC_Tool_Exists
+'
+'	ModBus Registers used:
+'
+'	Mach3 Buffer	Modbus Address		Cubloc Data Register	Use	
+'	In 66		hex7003			_D(3)			Input - result of tool query request from Mach to ATC
+'	Out 64		hex7000			_D(0)			Output - Commands to ATC
+'	In 64		hex7001			_D(1)			Input - Command from ATC - raise/lower spindle and error codes
+'	In 65		hex7002			_D(2)			Input - From ATC - current tool in spindle
+'
+'	Register Codes
+'
+'	Codes expected from ATC (in hex) through Modbus register 64/7001/_D(1)
+'	Dec	
+'	33	-	Requested tool not found in carousel
+'	50	-	ATC Ready - ATC has been initialized and is ready to go
+'	53	-	Error, No Tools detected
+'	54	-	Error, Too many tools loaded (carousel and spindle full, load/unload not possible
+'	56	-	Error, Drawbar error
+'	95	-	Command acknowledged by ATC
+'
+'	Codes expected from ATC (inhex through Modbus register 65/7002/_D(2)
+'	0-10	- 	Tool in spindle
+' 
+'	Codes expected from ATC (inhex through Modbus register 66/7003/_D(3)
+'	0	-	No tool currently in spindle
+'	1 to 10	-	Tool Slot number to be selected
+'	11 to 20 - 	Tool (return code -10) not found in carousel
+'
+'
+'
+Spin_Down = -44	' Spindle down on tool position
+Spin_Up = -2		' Spindle up position to clear carousel
+
+' first check if ATC is ready
+'
+ATC_State = GetInput(64)
+'
+'MsgBox "ATC Status " & ATC_State
+If ATC_State <> 50 Then
+	'
+	' ATC NOT ready
+	UResult= MsgBox("ATC Not Ready - Error Code " & ATC_State & " - " & "Reset ATC?  ",20,"ATC Error")	' 4 = display yes/no buttons
+	'
+	If UResult = 6	Then' Yes was selected - reset ATC
+		'
+		'
+		SetModOutput(64,99)	' send 99 - reset
+		'
+		Sleep 2000
+		SetModOutput(64,0)	' Reset Mod Reg.
+		' wait for ATC ready message
+		While GetInput(64) <> 50
+			' wait here while ATC resets
+			Sleep 100
+		Wend
+		MsgBox "ATC Reset Complete",0,"ATC Reset"		
+		'SetModOutput(64,0)		' Reset command register
+		'
+		' contine with tool change after ATC has been reset
+		'
+	ElseIf UResult = 7 Then		' No selected
+		'
+		' quit tool change
+		MsgBox "Failed Tool change - Current tool is still active",16,"Error"
+		SetModOutput(64,0)	' Reset command register
+		End
+		'	
+	End If
+	'
+End If
+'
+NewTool = GetSelectedTool()
+'
+If NewTool > 10 Then 
+
+	MsgBox "Invalid Tool No. Requested",0,"Tool Selection Error"
+	End
+End If
+'
+Code "M05"	' Turn off Spindle if not already off
+'
+' Check Modbus ATC for current loaded tool
+'	if ATC_Tool = 0 then no tool is loaded
+
+ATC_Tool = GetInput(65)		' get tool No. from ATC
+SetCurrentTool(ATC_Tool)
+'
+' Check that NewTool is available on the ATC
+'
+SetModOutput(64,NewTool+10)	' send tool number (+10) to ATC for lookup
+'msgbox "NewTool+10 = " & NewTool+10
+'
+'Wait for Ack from ATC
+While GetInput(64) <> 95
+	Sleep 100
+Wend
+SetModOutput(64,0)			' Reset Modbus Reg
+'
+'sleep 2000
+'While GetInput(66) = 0 	' wait for query result
+'	sleep 100
+'Wend
+'
+'MsgBox getinput(66)
+'
+sleep 2000
+ATC_Tool_Exists = GetInput(66)
+'
+If ATC_Tool_Exists >=1 And ATC_Tool_Exists <=10 Then
+	'
+	' Tool exists
+	'msgbox "Tool Exists " & ATC_Tool_Exists
+	'
+Else	'
+	MsgBox "Tool Not Found - ATC Returned " & ATC_Tool_Exists,16,"Tool Select Error"
+	End
+End If
+'
+' if tool exists contine
+'
+If ATC_Tool <> NewTool Then ' Requested tool is not tool in spindle. We can proceed.
+	'
+	If ATC_Tool <> 0 Then	' Currently tool in Spindle, Unload it.
+		'
+		'
+		Call Spindle_Down
+		'
+		Call SlideInUnclamp
+		Call Spindle_UP
+		'
+		Call Select_Slot(NewTool)	' rotate carousel to selected tool slot
+		'				'
+		Call Spindle_Down
+		'
+		Call ClampSlideOut
+		'
+		' Done !
+		'		
+	Else			' No tool in spindle, no unload required.
+		'
+		' load tool
+		'
+		Call Spindle_Up
+		'
+		Call Select_Slot(NewTool)
+		'		
+		Call SlideInUnClamp
+		'
+		Call Spindle_Down
+		'
+		Call ClampSlideOut
+		'
+		' Done !
+		'
+	End If
+	Sleep 1000
+	'
+	' wait for status on input 64. if 50 then change complete
+	If GetInput(64) = 50 Then	' ATC Ready
+		'
+		SetCurrentTool(NewTool)
+		'
+		' Reset Modbus Command reg.
+		SetModOutput(64,0)
+		'
+	Else
+		'
+		' Display message - give user option to reset ATC
+		'
+		MsgBox "Error loading tool " & NewTool,0,"Error"
+		UResult = MsgBox("Reset ATC ?",20,"ATC Error")
+		If UResult = 6	Then	' Yes was selected - reset ATC
+			'
+			SetModOutput(64,99)	' send 99 - reset
+			While GetInput(64) <> 50
+				' wait here while ATC resets
+				Sleep 100
+			Wend
+			MsgBox "ATC Reset Complete",0,"ATC Reset"
+			SetModOutput(64,0)	' Reset command register
+			End
+		Else
+			MsgBox "Current Tool Still Active - ATC in Error State!",16,"ATC Error"
+		End If
+		'
+		SetModOutput(64,0)		' Reset command register
+		'
+	End If
+	'	
+End If 
+
+End
+
+
+Sub Spindle_Down
+	'
+	' Spindle Down
+	Code "G53 G0 Z" & Spin_Down
+	While IsMoving()
+		' wait for z axis movement to complete
+	Wend
+	'
+End Sub
+		
+Sub Spindle_Up
+	'
+	'msgbox "Spin Up"
+	' Spindle Up
+	Code "G53 G0 Z" & Spin_Up
+	While IsMoving()
+		' wait for z axis movement to complete
+	Wend
+	'
+End Sub
+
+
+Sub ClampSlideOut
+	'
+	' ATC Clamp and slide Out
+	'
+	SetModOutput(64,88)	
+	'
+	'Wait for Ack from ATC
+	While GetInput(64) <> 95
+		Sleep 100
+	Wend
+	'
+	Sleep 1000
+	SetModOutput(64,0)		' reset modbus reg
+	'
+	While GetInput(64) <> 50	' Wait for ATC Ready signal 
+		'
+		If GetInput(64) = 56 Then 
+			' draw Bar error
+			SetModOutput(64,0)	' clear modbus reg
+			MsgBox "Drawbar Error - Check ATC!",16,"ATC Error"
+			End
+		End If
+		sleep 100
+	Wend
+	'
+End Sub
+
+Sub SlideInUnclamp
+	'	'
+	' send slide in and unclamp to ATC	' Slide In and unclamp
+	SetModOutput(64,77)
+	'	'
+	'Wait for Ack from ATC
+	While GetInput(64) <> 95
+		Sleep 100
+	Wend
+	'
+	'Sleep 1000
+	SetModOutput(64,0)		' reset modbus reg
+	Sleep 1000	
+	'
+	'
+	While GetInput(64) <> 50 	' Wait for ATC Ready Signal
+		'
+		If GetInput(64) = 56 Then 
+			' draw Bar error
+			SetModOutput(64,0)
+			MsgBox "Drawbar Error - Check ATC!",16,"ATC Error"
+			End
+		End If
+		sleep 200
+	Wend
+	'MsgBox "Slideinunclamp complete"
+	'
+End Sub
+
+Sub Select_Slot(ByVal Slot_Num As Single)
+	'
+	' Move Carousel to selected Slot
+	'
+	SetModOutput(64,Slot_Num)
+	'
+	'Wait for Ack from ATC
+	While GetInput(64) <> 95
+		Sleep 100
+	Wend
+	'Sleep 1000
+	'
+	SetModOutput(64,0)
+	Sleep 1000
+	'	
+	While GetInput(64) <> 50	' Wait for ATC Ready 
+		'
+		sleep 100
+	Wend
+	'
+End Sub
+        
+                                   

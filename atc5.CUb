@@ -1,0 +1,510 @@
+Const Device = CB320
+'
+Opencom 1,19200,3,80,80
+Set Modbus 1,1,100
+Set Ladder On
+Set I2c 9,8	' setup I2C - P9=SDA P8=SCK	
+' Need to define the follwoing variables:
+' 
+' Current_tool_number
+' Is_Spindle_Loaded
+Dim Tool_Array(10) As Integer	   	' a 10 element array - each element populated or not if tool present  
+Dim S_Offset As Integer   				' the number of steps needed to move from home position so tool position 1 is under tool sensor and 180 deg from spindle
+Dim Adjust As Integer					' the number of steps needed to travel after slideIn sensor trigger to final load position
+Dim NextTool As Integer		 			' the number of steps needed to move to next tool on Carousel
+Dim k As Integer							' counter for loops
+Dim Tool_Counter As Integer			' counter for inventory of tools
+Dim Requested_Tool As Integer			' requested tool number
+Dim Current_Tool As Integer			' tool currently loaded
+Dim Current_Slot As Integer			' Slot currently next to spindle
+Dim Empty_Slot As Integer				' last empty slot available
+Dim CW_Path As Long						' Clockwise path (no.Slots)to next requested tool
+Dim CCW_Path As Long						' Counter Clockwise path (No. Slots) to next requested tool
+Dim Error_Flag As Integer				' Error flag to send back through MODBUS for critical errors
+Dim z As Integer							' for testing
+Dim Selected_Slot As Integer			' Slot number selected through Modbus
+Dim Query_Tool As Integer				' Tool number to check if exists in carousel
+
+'
+NextTool = 80		' 80 steps per tool position (200 step/rev stepper, 4:1 reduction pulley)
+Tool_Counter = 0	' default - no tools
+Adjust = 8			' fine tune movement after sensor triggered. might need to move this into slidein sub as these seem to change after being used in stopstep command
+'
+Input 0		' Slide in Sensor
+Input 1		' Slide out sensor
+Input 2		' Index Sensor
+Input 3		' Carousel tool Sensor
+Input 4		' Spindle Tool Sensor
+Input 5		' Drawbar Sensor
+Input 22		' ATC Reset switch - using opto input
+Output 6		' Drawbar Output 
+Output 12 	' DirB - Carousel
+Output 13	' StepB - Carousel
+Output 14	' DirA - Slide
+Output 15	' StepA - Slide
+'
+'
+' Uses the following Data registers for MODBUS comms
+'
+' _D(0)	- Input - for Select Slot, unload tool, Clamp+SlideOut, SlideIn+Unclamp, Reset ATC
+' _D(1)	- Output - to send ATC_Ready, Status and error codes
+' _D(2)	- Output - to send back current tool number to host - update after tool changes
+' _D(3) 	- Output - to send back results of tool query.
+'
+' Init output registers
+_D(1) = 0
+_D(2) = 0
+_D(3) = 0
+'
+Init_ATC
+'
+Do
+	' check MODBUS for ATC commands
+	' 
+	If Error_Flag = 0 Then			' only process load and unload commands if not in error state
+		' Check for Select Slot command  - 1 to 10
+		'
+		If (_D(0) > 0 And _D(0) <= 10) Then
+  	 		'
+			Debug " ** Select Slot _D(0)="
+			Debug Dec  _D(0),Cr
+			Selected_Slot = _D(0)			
+			' Command recieved - send acknowedgment
+			_D(1) = 95	'	send ack code
+			'
+			' now wait for _D(0) to be reset
+			'
+			Do While _D(0) <> 0
+				' wait here
+			Loop
+			'			
+			Move_Slot Selected_Slot
+			'
+			Delay 1000
+			_D(1) = 50			' Send back status
+			OLED_Display 50	' ATC Ready
+		Endif
+		'
+		If (_D(0) >= 11 And _D(0) <= 20) Then
+  	 		'
+			' Command recieved - send acknowedgment
+			' 
+			_D(3) = 0											' set query return register to 0 to (Mach3 is waiting for a non zero value)
+			Debug " ** Tool Query = "
+			Debug Dec _D(0),Cr
+			'Debug Dec Tool_Array(0),Cr
+			'Debug Dec Tool_Array(1),Cr
+			'Debug Dec Tool_Array(2),Cr
+			'Debug Dec Tool_Array(3),Cr
+			'Debug Dec Tool_Array(4),Cr
+			'Debug Dec Tool_Array(5),Cr
+			'Debug Dec Tool_Array(6),Cr
+			'Debug Dec Tool_Array(7),Cr
+			'Debug Dec Tool_Array(8),Cr
+			'Debug Dec Tool_Array(9),Cr
+			'
+			Query_Tool = _D(0)
+			_D(1) = 95	'	send ack code				
+			'
+			' now wait for _D(0) to be reset
+			'
+			Do While _D(0) <> 0
+				' wait here
+			Loop
+			'	
+			'Delay 1000
+			If Tool_Array(Query_Tool-11) = 0 Then 		' Tool not found		
+				OLED_Display Query_Tool						' send message - "Not Found - Tool x"
+				Debug "tool not found. Tool Array = ",Cr
+				'Debug Dec Tool_Array(9),Cr
+				'
+				'
+				' set Modbus register to indicate tool not found
+				_D(3) = Query_Tool					' send back 11 to 20 to indicate tool not found
+				'Delay 1000
+				_D(1) = 50								' send ready
+				OLED_Display 50						' Display ATC Ready
+				'
+			Else
+				' 
+				' Tool Exists
+				Debug "Tool Exists - ",Cr
+				'Debug Dec _D(0),Cr
+				OLED_Display 51						' display "Tool Detected"
+				_D(3) = Query_Tool-10				' send back tool number to confirm
+				Delay 1000
+				_D(1) = 50
+				OLED_Display 50						' Display ATC Ready
+				'
+			Endif
+			'
+		Endif
+		'
+		If _D(0) = 77 Then
+			'
+			' Command recieved - send acknowedgment
+			_D(1) = 95	'	send ack code
+			' now wait for _D(0) to be reset
+			'
+			Do While _D(0) <> 0
+				' wait here
+			Loop
+			' Slide in and Unclamp requested
+			'
+			SlideInUnClamp
+			'
+			'Debug "return from proc",Cr
+			_D(1) = 50			' Send back status
+			OLED_Display 50	' Display ATC Ready
+		Endif
+		'
+		If _D(0) = 88 Then	' final step to tool load
+			'
+			' Command recieved - send acknowedgment
+			_D(1) = 95	'	send ack code
+			' now wait for _D(0) to be reset
+			'
+			Do While _D(0) <> 0
+				' wait here
+			Loop
+			'
+			' Clamp and SlideOut Requested
+			ClampSlideOut
+			'
+			_D(1) = 50					' Send back status
+			_D(2) = Current_Slot		' Current tool no. is now the current Slot no.
+			_D(3) = 0					' reset tool query register
+			OLED_Display 55	' load complete message
+			Delay 2000
+			OLED_Display 50	' ATC Ready
+		Endif			
+		'
+		
+	Endif	
+	'Check for Reset Command - 99 - always check for this even when in error state
+	'
+	Error_point:
+	If _D(0) = 99 Then	
+		' Command recieved - send acknowedgment
+		_D(1) = 95	'	send ack code		
+		' Reset ATC
+		OLED_Display 49
+		Delay 2000		' display reset message for 2 secs
+		Init_ATC
+		' 			
+	Endif
+	'
+	' Check ATC Reset switch on P22
+	'
+	If Keyin(22,20) = 0 Then
+		Init_ATC
+	Endif
+	'		
+Loop
+End
+'
+Sub OLED_Display(x As Byte)
+	'
+	I2cstart
+	If I2cwrite(&b00010000) = 1 Then Debug "I2C Error - No response from slave",Cr	' slave address 08 - remember LSB signifies read or write - 1=read,0=write and 7 bits used for address 
+	If I2cwrite(x) = 1 Then Debug "I2C Error - No repsonse writing to slave",Cr
+	I2cstop
+	'
+	' supported commands by display are as follows:
+	' 
+	' x=1 to 10 for "select Slot x"	  		
+	' x=11 to 20 for "Not Found - Tool x" 
+	' x=31 to 40 for "Tools Found x"
+	' x=61 to 70 for "Checking slot x"
+ 	' x=41 "Clamp"								
+  	' x=42 "Unclamp"
+	' x=43 "Initializing..."
+ 	' x=44 "Carousel In"
+  	' x=45 "Carousel Out"
+	' x=49 "Reset ATC...."
+	' x=50 "ATC Ready"
+	' x=51 "Tool Detected"
+	' x=52 "Inventory.."
+	' x=53 "No Tools Found!"
+	' x=54 "Too Many Tools!"
+	' x=55 "Load complete"					
+	' x=56 "Drawbar Error!"
+ '  	
+End Sub
+'
+Sub Drawbar(y As Byte)
+	'
+	' clamp = 1
+	' unclamp = 0
+	'
+	If y = 1 Then 	' clamp tool to load
+		'	
+		OLED_Display 41		' Display "Clamp"
+		Low 6 	' unclamp tool - turn off air switch
+		'		Drawbar sensor on P5 - sensor active low on unclamp	
+		Delay 1000	' wait for cylinder to energise.
+		'
+		If In(5) = 0 Then
+			'
+			' tool is unclamped -  possible air pressure problem. Tool cannot be loaded
+			' Set error flag
+			' unable to continue until this is fixed.
+			'
+			Error_Flag = 56
+			_D(1) = 56
+			OLED_Display 56	' send "Drawbar Error!" to display
+			Delay 2000
+			Goto Error_point
+			'
+		Endif
+		'
+	Else 
+		'
+		OLED_Display 42		' Display "Unclamp"
+		High 6	' unclamp tool to release 
+		'	
+		Delay 1000
+		' wait for cylinder to energise
+		If In(5) = 1 Then
+			' 
+			' error - sensor should be low on unclamp - possible air pressure problem. Tool can not be released
+			' set error flag
+			' unable to continue util thi is fixed.
+			'
+			Error_Flag = 56
+			_D(1) = 56
+			OLED_Display 56	' send "Drawbar Error!" to display
+			Delay 2000			
+			Goto Error_point
+			'
+		Endif
+		Debug "unclamped",Cr
+		'		
+	Endif
+	'
+End Sub
+'
+Sub SlideIn()
+	'
+	' move the ATC in until slide in sensor triggers
+	' after sensor triggered - move a number of steps to final position
+	' keep trach of number of steps - if too many steps, there must be an error
+	' move the ATC out until slide out sensor triggers
+	OLED_Display 44	' send "Carousel In" message
+	Low 15				' set direction - move to left
+	Steppulse 0,15,900,14500			' move max of 300mm - 1:1 drive ratio 200steps/rev 4mm ballscrew - slide in sensor - P0
+	Do While (In(0) <> 0)
+		'wait here until complete or P0 sensor is triggered		
+	Loop
+	Stepstop 0
+	' move a little to the left - fine tuning....
+	'Steppulse 0,15,300,Adjust	
+	'
+	Debug "slideIn",Cr
+	
+End Sub
+'
+Sub SlideOut()
+	'
+   'move the ATC Out Until slide Out sensor triggers
+	OLED_Display 45	' send "Carousel Out" message
+	High 14				' set direction - move to left
+	Steppulse 0,15,900,15000			' move max of 300mm - 1:1 drive ratio 200steps/rev 4mm ballscrew - slide out sensor - P1
+	Do While (In(1) <> 0)		
+		' wait here until complete or P1 sensor is triggered		
+	Loop
+	Stepstop 0
+	' move a little to the left to clear sensor
+	Low 14			' set direct - move to right by 10mm (500 steps)	
+	Steppulse 0,15,500,500
+	Do While Stepstat(0) > 0
+		' wait here until stepping complete
+	Loop
+	'	
+End Sub
+'
+Sub Init_ATC()
+	'
+	' Startup ATC
+	' Slide carousel to left home Position	'
+	' Rotate Carousel to index position
+	' Current position of slide and carousel is not known at this stage
+	' Do Inventory
+	' finally move slot 0 to face spindle - at end of inventory process, slot 10 in under sensor
+	' send status to display
+	S_Offset = 34				' no steps to firts tool position after index sensor triggered.
+	OLED_Display 43			' send 'Initializing...' message
+	Delay 2000
+	Tool_Counter = 0
+	Empty_Slot = 0
+	Current_Tool = 0
+	k = 0
+	'
+	' Move Carousel to left park position
+	SlideOut		
+	' Now rotate carousel to index position
+	OLED_Display 52	' send "Inventory..." message	
+	Low 12				' Direction Clockwise
+	Steppulse 0,13,100,800	' StepB - P13 - 100Hhz, 800 steps max = 1 carousel revolution. - index sensor on P2
+	Do While (In(2) <> 0)	
+		' wait here until complete or P2 sensor is triggered	
+	Loop	
+	Stepstop 0
+	' now move carousel so tool slot 1 is under sensor
+	Steppulse 0,13,100,S_Offset	' move carousel by offset pulses - this is the movement required to rotate slot to line up
+	'										' with tool sensor after index sensor has been triggered	
+	'
+	Do While Stepstat(0) > 0
+		' wait here until stepping complete
+	Loop	
+	' call the above tool slot 1 - Tool sensor on P3
+	' next populate tool array
+	For k=0 To 9
+		OLED_Display 61+k		' send "Checking Slot x" message
+		Debug Dec ? k,Cr
+		Delay 1000
+		If In(3) = 0 Then		' tool detected		
+			Tool_Counter = Tool_Counter+1
+			Tool_Array(k) = 1
+			OLED_Display 51		' send "Tool Detected" message
+			Delay 1000
+			'
+			Debug "Slot " 
+			Debug Dec k+1
+			Debug " Tool Found",Cr
+			'
+		Else		
+			Empty_Slot = k+1			' set last empty slot (add 1 since k ranges from 0 to 9, slots from 1 -10)
+			Tool_Array(k) = 0			
+		Endif
+		' Move to next Slot
+		Steppulse 0,13,100,80	' 80 steps to next slot
+		Do While Stepstat(0) > 0
+			' wait for stepping to complete
+		Loop
+	Next
+	'
+	' set current slot - this is slot 6 - oppersite slot 1 which is currently under tool sensor
+	Current_Slot = 6
+	'
+	'Check if spindle contains a tool. Spindle sensor P4
+	'
+	If In(4) = 1 Then				
+		' tool detected in spindle
+		Debug "Spindle Tool sensor = high",Cr
+		If Tool_Counter = 10 Then			
+			'too many tools - 10 in carousel + 1 in spindle - error condition
+			OLED_Display 54	' display error message - maybe make a specific error for this
+									' maybe set an error flag? so operation does not go on?
+									' need to correct and get a reset command 
+			Error_Flag = 54
+			_D(1) = 54			' signal error to MODBUS
+			Delay 2000			' wait 2 seconds
+			Goto Error_point	' go back to main loop and wait for reset		
+		Elseif Tool_Counter <= 9 Then		
+			' Less than 10 tools 		- must be an empty slot avaialable
+			' allocate tool in spindle to last empty slot number and change to current tool number
+			Delay 1000
+			Current_Tool = Empty_Slot	' set tool number of tool in spindle to slot number
+			Debug "Tool in Spindle = "
+			Debug Dec ? Current_Tool,Cr
+			_D(2) = Current_Tool			' send current tool in spindle to modbus
+			Move_Slot Empty_Slot			' move carousel to position empty slot next to spindle
+												' ready for future unload command												
+			' since tool found in spindle, we must update tool array with this tool.
+			Tool_Array(Empty_Slot-1) = 1		' remember - array element are 0 to 9
+			Tool_Counter = Tool_Counter+1		' add spindle tool to tool count			
+		Endif	
+	Elseif In(4) = 0 Then
+		' No Tool in spindle	
+		' Current slot is still slot 6
+		'
+		Current_Tool = 0	
+		_D(2) = Current_Tool				' send current tool in spindle to modbus
+		'	
+	Endif	
+	' Check we have at least one tool!
+	If Tool_Counter = 0 Then	
+		' No tools detected - error!!
+		OLED_Display 53		' Send "No Tools Found!" message
+		Error_Flag = 53
+		_D(1) = 53				' signal error to MODBUS
+		Delay 2000
+		Goto Error_point	
+	Else	
+		' report no. of tools detected
+		OLED_Display Tool_Counter+30
+		Delay 1000
+		OLED_Display 50				' display "ATC Ready" message
+		Error_Flag = 0					' clear error flag
+		_D(1) = 50						' signal ATC ready to modbus		
+	Endif			
+End Sub
+'
+Sub Move_Slot(x As Integer)
+	'
+	If x=Current_Slot	Then				' no move needed - exit
+		Exit Sub
+	Endif
+	'
+	OLED_Display x						' Display Select Slot x
+	' sub to move to requested slot - tools are numbered clockwise 1 to 10
+	' 80 steps per slot
+	' determine if move should be clockwise or anti-clockwise based on current position and new position
+	'
+	'Exit Sub
+	If x > Current_Slot Then
+		'
+		CW_Path = x-Current_Slot
+		CCW_Path = 10-CW_Path
+		'
+	Elseif x < Current_Slot Then
+		'
+		CW_Path = x-Current_Slot
+		CCW_Path = CW_Path*-1
+		CW_Path = 10-CCW_Path
+		'
+	Endif
+	' Dir output P12
+	' Step Output P13
+	'	
+	If CW_Path <= CCW_Path Then  
+  		Low 12			' Clockwise
+		'Stepaccel 0,13,50,500,1000,80
+		Steppulse 0,13,100,CW_Path*80
+	Else	
+		High 12			' Counter Clockwise
+		Steppulse 0,13,100,CCW_Path*80
+		'Stepaccel 0,13,50,500,1000,80		
+	Endif
+	Current_Slot = x				' update current slot
+	'	
+End Sub
+'
+Sub Reset_ATC()
+	'
+	' This proc runs if a Reset ATC command is received on MODBUS
+	OLED_Display 49
+	Delay 1000
+	Init_ATC
+	'
+End Sub
+'
+Sub ClampSlideOut()
+	'
+	Drawbar 1
+	SlideOut
+	'
+End Sub
+'
+Sub SlideInUnClamp()
+	'
+	SlideIn
+	Drawbar 0
+	'
+End Sub
+
+
+
+
+
